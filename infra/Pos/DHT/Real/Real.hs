@@ -14,7 +14,7 @@ module Pos.DHT.Real.Real
 import           Nub (ordNub)
 -- We'll take 'catch' from Control.Exception
 -- Universum uses the one from Control.Exception.Safe
-import           Universum hiding (catch)
+import           Universum hiding (catch, init)
 
 import           Control.Concurrent (threadDelay)
 import           Control.Exception (throwIO, try, catch)
