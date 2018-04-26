@@ -5,7 +5,7 @@ module Main
 import           Universum
 
 import           Control.Exception.Safe (handle)
-import           Data.Maybe (fromJust)
+import           Data.Maybe (fromMaybe)
 import           Formatting (sformat, shown, (%))
 import           JsonLog (jsonLog)
 import           Mockable (Production, runProduction)
@@ -128,7 +128,7 @@ action opts@AuxxOptions {..} command = do
                         { acRealModeContext = realModeContext
                         , acTempDbUsed = tempDbUsed }
                 lift $ runReaderT auxxAction auxxContext
-        let vssSK = fromJust $ npUserSecret nodeParams ^. usVss
+        let vssSK = fromMaybe (error "no user secret given") $ npUserSecret nodeParams ^. usVss
         let sscParams = CLI.gtSscParams cArgs vssSK (npBehaviorConfig nodeParams)
         bracketNodeResources nodeParams sscParams txpGlobalSettings initNodeDBs $ \nr -> do
             let runIO = runProduction . elimRealMode nr . toRealMode
