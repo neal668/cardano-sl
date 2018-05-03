@@ -109,6 +109,7 @@ library
                      , aeson
                      , aeson-pretty
                      , beam-core
+                     , beam-migrate
                      , beam-sqlite
                      , bytestring
                      , cardano-sl
