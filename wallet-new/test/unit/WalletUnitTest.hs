@@ -109,16 +109,30 @@ testTranslation = do
 testPureWallet :: Spec
 testPureWallet = do
     it "Test pure wallets" $
-      forAll genInductive $ \ind -> conjoin [
-          checkInvariants "base"      ind baseEmpty
-        , checkInvariants "incr"      ind incrEmpty
-        , checkInvariants "pref"      ind prefEmpty
-        , checkInvariants "roll"      ind rollEmpty
-        , checkInvariants "full"      ind fullEmpty
-        , checkEquivalent "base/incr" ind baseEmpty incrEmpty
-        , checkEquivalent "base/pref" ind baseEmpty prefEmpty
-        , checkEquivalent "base/roll" ind baseEmpty rollEmpty
-        , checkEquivalent "base/full" ind baseEmpty fullEmpty
+      forAll genInductive $ \indWithRoll ->
+        let noRollbacks = uptoFirstRollback (inductiveWalletDef indWithRoll)
+            indDontRoll = indWithRoll { inductiveWalletDef = noRollbacks }
+
+        in conjoin [
+          -- sanity check on the test
+          uptoFirstRollback noRollbacks `shouldBe` noRollbacks
+        , shouldBeValidated (void (inductiveIsValid indWithRoll))
+
+          -- check that the invariants hold in each model
+        , checkInvariants "base"      indDontRoll baseEmpty
+        , checkInvariants "incr"      indDontRoll incrEmpty
+        , checkInvariants "pref"      indDontRoll prefEmpty
+        , checkInvariants "roll"      indWithRoll rollEmpty
+        , checkInvariants "full"      indWithRoll fullEmpty
+
+          -- check equivalence between the models (no rollbacks)
+        , checkEquivalent "base/incr" indDontRoll baseEmpty incrEmpty
+        , checkEquivalent "base/pref" indDontRoll baseEmpty prefEmpty
+        , checkEquivalent "base/roll" indDontRoll baseEmpty rollEmpty
+        , checkEquivalent "base/full" indDontRoll baseEmpty fullEmpty
+
+          -- check equivalence between models (with rollbacks)
+        , checkEquivalent "roll/full" indWithRoll rollEmpty fullEmpty
         ]
 
     it "Sanity check rollback" $ do

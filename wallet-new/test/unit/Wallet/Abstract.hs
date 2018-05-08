@@ -17,7 +17,12 @@ module Wallet.Abstract (
   , applyBlocks
     -- * Inductive wallet definition
   , Inductive(..)
+  , uptoFirstRollback
   , interpret
+    -- ** Validation
+  , ValidatedInductive(..)
+  , InductiveValidationError(..)
+  , inductiveIsValid
     -- ** Invariants
   , Invariant
   , invariant
@@ -51,7 +56,7 @@ import qualified Data.Text.Buildable
 import           Formatting (bprint, build, sformat, (%))
 import           Pos.Util.Chrono
                    (NewestFirst(NewestFirst), toNewestFirst,
-                    OldestFirst(OldestFirst))
+                    OldestFirst(OldestFirst), getOldestFirst, getNewestFirst)
 import           Pos.Util.QuickCheck.Arbitrary (sublistN)
 import           Serokell.Util (listJson)
 import           Test.QuickCheck
@@ -192,6 +197,16 @@ data Inductive h a =
   | Rollback (Inductive h a)
   deriving Eq
 
+-- | The prefix of the 'Inductive' that doesn't include any rollbacks
+uptoFirstRollback :: Inductive h a -> Inductive h a
+uptoFirstRollback = go identity
+  where
+    go :: (Inductive h a -> Inductive h a) -> Inductive h a -> Inductive h a
+    go  acc (WalletBoot t)   = acc (WalletBoot t)
+    go  acc (ApplyBlock i b) = go (acc . (`ApplyBlock` b)) i
+    go  acc (NewPending i t) = go (acc . (`NewPending` t)) i
+    go _acc (Rollback i)     = go identity                 i
+
 -- | Interpreter for 'Inductive'
 --
 -- Given (one or more) wallet constructors, evaluate an 'Inductive' wallet,
@@ -242,6 +257,166 @@ interpret invalidInput mkWallets p = fmap snd . go
           Just w' -> return w'
           Nothing -> throwError . invalidInput ind
                    $ InvalidPending tx (utxo w) (pending w) l
+
+{-------------------------------------------------------------------------------
+  Validation
+-------------------------------------------------------------------------------}
+
+-- | Pair an 'Inductive' wallet definition with the set of addresses owned
+data InductiveWithOurs h a = InductiveWithOurs {
+      inductiveWalletOurs :: Set a
+    , inductiveWalletDef  :: Inductive h a
+    }
+
+-- | Result of validating an inductive wallet
+data ValidatedInductive h a = ValidatedInductive {
+      -- | Bootstrap transaction used
+      viBoot :: Transaction h a
+
+      -- | Final ledger (including bootstrap)
+    , viLedger :: Ledger h a
+
+      -- | Final chain (split into blocks, not including bootstrap)
+    , viChain :: Chain h a
+
+      -- | UTxO after each block, in
+    , viUtxos :: NewestFirst NonEmpty (Utxo h a)
+    }
+
+data InductiveValidationError h a =
+    -- | Bootstrap transaction is invalid
+    InductiveInvalidBoot {
+        -- | The bootstrap transaction
+        inductiveInvalidBoot :: Transaction h a
+
+        -- | The error message
+      , inductiveInvalidError :: Text
+      }
+
+    -- | Invalid transaction in the given block
+  | InductiveInvalidApplyBlock {
+        -- | The 'Inductive' leading up to the error
+        inductiveInvalidInductive :: Inductive h a
+
+        -- | The transactions in the block we successfully validated
+      , inductiveInvalidBlockPrefix :: OldestFirst [] (Transaction h a)
+
+        -- | The transaction that was invalid
+      , inductiveInvalidTransaction :: Transaction h a
+
+        -- | The error message
+      , inductiveInvalidError :: Text
+      }
+
+    -- | A 'NewPending' call was invalid because the input was already spent
+  | InductiveInvalidNewPendingAlreadySpent {
+        -- | The 'Inductive' leading up to the error
+        inductiveInvalidInductive :: Inductive h a
+
+        -- | The transaction that was invalid
+      , inductiveInvalidTransaction :: Transaction h a
+
+        -- | The specific input that was not valid
+      , inductiveInvalidInput :: Input h a
+      }
+
+    -- | A 'NewPending' call was invalid because the input was not @ours@
+  | InductiveInvalidNewPendingNotOurs {
+        -- | The 'Inductive' leading up to the error
+        inductiveInvalidInductive :: Inductive h a
+
+        -- | The transaction that was invalid
+      , inductiveInvalidTransaction :: Transaction h a
+
+        -- | The specific input that was not valid
+      , inductiveInvalidInput :: Input h a
+
+        -- | The address this input belonged to
+      , inductiveInvalidAddress :: a
+      }
+
+-- | Lift ledger validity to 'Inductive'
+inductiveIsValid :: forall h a. (Hash h a, Buildable a, Ord a)
+                 => InductiveWithOurs h a
+                 -> Validated (InductiveValidationError h a) (ValidatedInductive h a)
+inductiveIsValid InductiveWithOurs{..} = goInd inductiveWalletDef
+  where
+    goInd :: Inductive h a
+          -> Validated (InductiveValidationError h a) (ValidatedInductive h a)
+    goInd (WalletBoot boot) = do
+      let ledger = ledgerEmpty
+      validatedMapErrors (InductiveInvalidBoot boot) $
+        trIsAcceptable boot ledger
+      return ValidatedInductive {
+          viBoot   = boot
+        , viLedger = ledgerAdd boot ledger
+        , viChain  = OldestFirst []
+        , viUtxos  = NewestFirst (trUtxo boot :| [])
+        }
+    goInd (ApplyBlock i b) = do
+      ValidatedInductive{..} <- goInd i
+      ledger' <- goBlock i (OldestFirst []) viLedger b
+      let chain' = OldestFirst . (++ [b]) . getOldestFirst $ viChain
+          utxos' = NewestFirst
+                 . (\(u :| us) -> utxoApplyBlock b u :| (u:us))
+                 . getNewestFirst
+                 $ viUtxos
+      return ValidatedInductive {
+          viBoot   = viBoot
+        , viLedger = ledger'
+        , viChain  = chain'
+        , viUtxos  = utxos'
+        }
+    goInd (NewPending i t) = do
+      vi@ValidatedInductive{..} <- goInd i
+      let utxo     = let NewestFirst (u :| _) = viUtxos in u
+          inputs   = Set.toList (trIns t)
+          resolved = map (`utxoAddressForInput` utxo) inputs
+      forM_ (zip inputs resolved) $ \(input, mAddr) ->
+        case mAddr of
+          Nothing ->
+            throwError InductiveInvalidNewPendingAlreadySpent {
+                inductiveInvalidInductive   = i
+              , inductiveInvalidTransaction = t
+              , inductiveInvalidInput       = input
+              }
+          Just addr ->
+            unless (addr `Set.member` inductiveWalletOurs) $
+              throwError InductiveInvalidNewPendingNotOurs {
+                  inductiveInvalidInductive   = i
+                , inductiveInvalidTransaction = t
+                , inductiveInvalidInput       = input
+                , inductiveInvalidAddress     = addr
+                }
+      return vi
+    goInd (Rollback i) = do
+      ValidatedInductive{..} <- goInd i
+      -- strip latest block
+      let chain' = OldestFirst . List.init . getOldestFirst $ viChain
+          utxos' = NewestFirst
+                 . (\(_u :| (u':us)) -> u' :| us)
+                 . getNewestFirst
+                 $ viUtxos
+      return ValidatedInductive {
+          viBoot   = viBoot
+        , viLedger = chainToLedger viBoot chain'
+        , viChain  = chain'
+        , viUtxos  = utxos'
+        }
+
+    goBlock :: Inductive h a -- Inductive leading to this point (for err msgs)
+            -> Block h a     -- Prefix of the block already validated (for err msgs)
+            -> Ledger h a    -- Ledger so far
+            -> Block h a     -- Suffix of the block yet to validate
+            -> Validated (InductiveValidationError h a) (Ledger h a)
+    goBlock i = go
+      where
+        go _ ledger (OldestFirst []) =
+          return ledger
+        go (OldestFirst done) ledger (OldestFirst (t:todo)) = do
+          validatedMapErrors (InductiveInvalidApplyBlock i (OldestFirst done) t) $
+            trIsAcceptable t ledger
+          go (OldestFirst (done ++ [t])) (ledgerAdd t ledger) (OldestFirst todo)
 
 {-------------------------------------------------------------------------------
   Invariants
@@ -598,13 +773,6 @@ genFromBlocktree
 genFromBlocktree addrs fpc =
     runInductiveGen fpc (genInductiveFor addrs)
 
--- | Pair an 'Inductive' wallet definition with the set of addresses owned
-data InductiveWithOurs h a = InductiveWithOurs {
-      inductiveWalletOurs :: Set a
-    , inductiveWalletDef  :: Inductive h a
-    }
-
-;
 -- | Given a predicate function that selects addresses that
 -- belong to the generated 'Inductive' wallet and the 'FromPreChain' value
 -- that contains the relevant blockchain, this will build a set of addrs and
@@ -1098,3 +1266,46 @@ instance (Hash h a, Buildable a) => Buildable (InductiveWithOurs h a) where
     )
     inductiveWalletOurs
     inductiveWalletDef
+
+instance (Hash h a, Buildable a) => Buildable (InductiveValidationError h a) where
+  build InductiveInvalidBoot{..} = bprint
+    ( "InductiveInvalidBoot"
+    % "{ boot:  " % build
+    % ", error: " % build
+    % "}"
+    )
+    inductiveInvalidBoot
+    inductiveInvalidError
+  build InductiveInvalidApplyBlock{..} = bprint
+    ( "InductiveInvalidApplyBlock"
+    % "{ inductive:   " % build
+    % ", blockPrefix: " % build
+    % ", transaction: " % build
+    % ", error:       " % build
+    % "}")
+    inductiveInvalidInductive
+    inductiveInvalidBlockPrefix
+    inductiveInvalidTransaction
+    inductiveInvalidError
+  build InductiveInvalidNewPendingAlreadySpent{..} = bprint
+    ( "InductiveInvalidNewPendingAlreadySpent"
+    % "{ inductive:   " % build
+    % ", transaction: " % build
+    % ", input:       " % build
+    % "}"
+    )
+    inductiveInvalidInductive
+    inductiveInvalidTransaction
+    inductiveInvalidInput
+  build InductiveInvalidNewPendingNotOurs{..} = bprint
+    ( "InductiveInvalidNewPendingNotOurs"
+    % "{ inductive:   " % build
+    % ", transaction: " % build
+    % ", input:       " % build
+    % ", address:     " % build
+    % "}"
+    )
+    inductiveInvalidInductive
+    inductiveInvalidTransaction
+    inductiveInvalidInput
+    inductiveInvalidAddress
