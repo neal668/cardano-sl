@@ -47,7 +47,7 @@ module Wallet.Abstract (
 import qualified Data.Foldable as Fold
 import qualified Data.Map as Map
 import qualified Data.Set as Set
-import qualified Data.Tree as Tree
+import           Data.Tree (Tree(..))
 import           Universum
 
 import qualified Data.IntMap as IntMap
@@ -63,7 +63,7 @@ import           Test.QuickCheck
 
 import           Util
 import           Util.Validated
-import           UTxO.BlockGen (selectDestination, estimateFee)
+import           UTxO.BlockGen (estimateFee)
 import           UTxO.Context
 import           UTxO.Crypto
 import           UTxO.DSL
@@ -833,20 +833,25 @@ genInductiveFor addrs = do
     intersperseTransactions boot addrs (treeToApplyBlocks tree)
 
 -- | Linearise a blocktree to a list of actions.
---
---   Because we construct the tree to have the principal branch on the RHS, this
---   is just given by the pre-order traversal, except we record Rollbacks any time
---   we backtrack.
-treeToApplyBlocks :: BlockTree h a -> [Action h a]
-treeToApplyBlocks (OldestFirst root) = reverse . fst $ go root ([], 1)
+treeToApplyBlocks :: forall h a. BlockTree h a -> [Action h a]
+treeToApplyBlocks = stripRollbacks . go . getOldestFirst
   where
-    treeHeight = length $ Tree.levels root
-    go (Tree.Node val []) (acc, lvl)
-      | lvl == treeHeight = (ApplyBlock' val : acc, lvl)
-      | otherwise = (Rollback' : ApplyBlock' val : acc, lvl - 1)
-    go (Tree.Node val xs) (acc, lvl) =
-      foldr go (ApplyBlock' val : acc, lvl + 1) xs
+    -- Preorder traversal, matching each @ApplyBlock'@ with a @Rollback@.
+    go :: Tree (Block h a) -> [Action h a]
+    go (Node block branches) = concat [
+        [ApplyBlock' block]
+      , concatMap go branches
+      , [Rollback']
+      ]
 
+    -- each time we go back up the tree, we generate rollbacks; but we don't
+    -- want to do that for the very last branch.
+    stripRollbacks :: [Action h a] -> [Action h a]
+    stripRollbacks = reverse . dropWhile isRollback' . reverse
+
+    isRollback' :: Action h a -> Bool
+    isRollback' Rollback' = True
+    isRollback' _         = False
 
 blocksToLedger :: Chain h a -> Ledger h a
 blocksToLedger blocks = Ledger $ NewestFirst $ do
@@ -953,7 +958,7 @@ synthesizeTransactions
     -> Set (Input h Addr) -- ^ Inputs already spent
     -> InductiveGen h (IntMap [Action h Addr])
 synthesizeTransactions addrs blocks alreadySpent = do
-    let nextHash :: Int = minBound  -- negative hashes are not used elsewhere.
+    let nextHash :: Int = (-1)  -- negative hashes are not used elsewhere.
     liftGen $ go IntMap.empty nextHash (Utxo mempty) alreadySpent 0 blocks
   where
     -- NOTE: We maintain a UTxO as we process the blocks. There are (at least)
@@ -1004,8 +1009,8 @@ synthesizeTransactions addrs blocks alreadySpent = do
           -- 5% of the time, we create a new transaction using one of UTxOs in
           -- `utxoAvail` as input:
           (i, o) <- elements $ utxoToList utxoAvail
-          -- ... and a not yet spent addresses in `utxoAfter` as output:
-          dest :: Addr <- selectDestination (utxoRemoveInputs spent utxoAfter)
+          -- ... and an address owned by the wallet as output
+          dest <- elements (Set.toList addrs)
           let txn :: Transaction h Addr = Transaction
                   { trFresh = 0
                   , trFee   = estimateFee txn -- lazy enough, doesn't diverge
@@ -1015,7 +1020,7 @@ synthesizeTransactions addrs blocks alreadySpent = do
                   , trExtra = [] }
               act :: Action h Addr = newPending' ["never confirmed"] txn
           go (IntMap.insert ix [act] acc)
-             (nextHash + 1)
+             (nextHash - 1)
              utxoAfter
              (Set.insert i spent)
              (ix + 1)

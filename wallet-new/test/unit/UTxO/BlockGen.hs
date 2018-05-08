@@ -6,113 +6,64 @@
 {-# LANGUAGE ViewPatterns               #-}
 
 module UTxO.BlockGen
-    ( genValidBlockchain
-    , genValidBlocktree
+    ( genValidBlocktree
     , divvyUp
-    , selectDestination
-    , selectDestinations'
     , estimateFee
     ) where
 
 import           Universum hiding (use, (%~), (.~), (^.))
 
 import           Control.Category (id)
+import           Control.Exception (throw)
 import           Control.Lens hiding (elements)
 import           Data.List.NonEmpty (NonEmpty (..))
 import qualified Data.Map as Map
+import qualified Data.List.NonEmpty as NE
 import qualified Data.Set as Set
 import           Data.Tree (Tree)
 import qualified Data.Tree as Tree
+import           GHC.Stack (HasCallStack)
 import           Pos.Util.Chrono
-import           Test.QuickCheck
+import           System.IO.Error (userError)
+import           Test.QuickCheck hiding (elements)
+import qualified Test.QuickCheck as QuickCheck
 
 import           Util.DepIndep
 import           UTxO.Context
 import           UTxO.DSL
 import           UTxO.PreChain
 
--- | Blockchain Generator Monad
---
--- When generating transactions, we need to keep track of addresses,
--- balances, and transaction IDs so that we can create valid future
--- transactions without wasting time searching and validating.
-newtype BlockGen h a
-    = BlockGen
-    { unBlockGen :: StateT (BlockGenCtx h) Gen a
-    } deriving (Functor, Applicative, Monad, MonadState (BlockGenCtx h))
+{-------------------------------------------------------------------------------
+  Auxiliary
+-------------------------------------------------------------------------------}
 
--- | The context and settings for generating arbitrary blockchains.
-data BlockGenCtx h
-    = BlockGenCtx
-    { _blockGenCtxCurrentUtxo            :: !(Utxo h Addr)
-    -- ^ The mapping of current addresses and their current account values.
-    , _blockGenCtxFreshHashSrc           :: !Int
-    -- ^ A fresh hash value for each new transaction.
-    , _blockGenCtxInputPartiesUpperLimit :: !Int
-    -- ^ The upper limit on the number of parties that may be selected as
-    -- inputs to a transaction
-    }
+-- | Variation on 'replicateM' with state and potential early termination
+replicateSt :: Monad m => Int -> (s -> m (Maybe (a, s))) -> (s -> m ([a], s))
+replicateSt 0 _ st = return ([], st)
+replicateSt n f st = do
+    ma <- f st
+    case ma of
+      Nothing       -> return ([], st)
+      Just (a, st') -> do (as, st'') <- replicateSt (n - 1) f st'
+                          return (a : as, st'')
 
-makeFields ''BlockGenCtx
+-- | Variation on QuickCheck's elements with a better callstack on errors
+elements :: HasCallStack => [a] -> Gen a
+elements [] = throw $ userError ("elements: empty list at " ++ prettyCallStack callStack)
+elements xs = QuickCheck.elements xs
 
-genValidBlockchain :: Hash h Addr => PreChain h Gen ()
-genValidBlockchain = toPreChain newChain
+-- | Choose (up to) @n@ /distinct/ elements out of the given list
+distinct :: Int -> [a] -> Gen [a]
+distinct 0 _  = return []
+distinct _ [] = return []
+distinct n xs = do
+    i <- choose (0, length xs - 1)
+    let (xsBefore, x:xsAfter) = splitAt i xs
+    (x:) <$> distinct (n - 1) (xsBefore ++ xsAfter)
 
-toPreChain
-    :: Hash h Addr
-    => BlockGen h [[Value -> Transaction h Addr]]
-    -> PreChain h Gen ()
-toPreChain = toPreChainWith identity
-
-toPreChainWith
-    :: Hash h Addr
-    => (BlockGenCtx h -> BlockGenCtx h)
-    -> BlockGen h [[Value -> Transaction h Addr]]
-    -> PreChain h Gen ()
-toPreChainWith settings bg = DepIndep $ \boot -> do
-    ks <- runBlockGenWith settings boot bg
-    return $ \fees -> (markOldestFirst (zipFees ks fees), ())
-  where
-   markOldestFirst = OldestFirst . fmap OldestFirst
-
--- | Given an initial bootstrap 'Transaction' and a function to customize
--- the other settings in the 'BlockGenCtx', this function will initialize
--- the generator and run the action provided.
-runBlockGenWith
-    :: Hash h Addr
-    => (BlockGenCtx h -> BlockGenCtx h)
-    -> Transaction h Addr
-    -> BlockGen h a
-    -> Gen a
-runBlockGenWith settings boot m =
-    evalStateT (unBlockGen m) (settings (initializeCtx boot))
-
--- | Create an initial context from the boot transaction.
-initializeCtx :: Hash h Addr => Transaction h Addr -> BlockGenCtx h
-initializeCtx boot = BlockGenCtx {..}
-  where
-    _blockGenCtxCurrentUtxo = trUtxo boot
-    _blockGenCtxFreshHashSrc = 1
-    _blockGenCtxInputPartiesUpperLimit = 1
-
--- | Lift a 'Gen' action into the 'BlockGen' monad.
-liftGen :: Gen a -> BlockGen h a
-liftGen = BlockGen . lift
-
--- | Provide a fresh hash value for a transaction.
-freshHash :: ( HasFreshHashSrc src Int
-             , MonadState src m
-             )
-          => m Int
-freshHash = do
-    i <- use freshHashSrc
-    freshHashSrc += 1
-    pure i
-
-nonAvvmUtxo :: HasCurrentUtxo src (Utxo h Addr)
-            => Getter src (Utxo h Addr)
-nonAvvmUtxo =
-    currentUtxo . to (utxoRestrictToAddr (not . isAvvmAddr))
+{-------------------------------------------------------------------------------
+  Preliminaries
+-------------------------------------------------------------------------------}
 
 selectSomeInputs' :: Hash h Addr
                   => Int
@@ -129,55 +80,11 @@ selectSomeInputs' upperLimit (utxoToMap -> utxoMap) = do
     pure (input1 :| otherInputs)
   where
     loop utxo n
-        | n <= 0 = pure []
+        | n <= 0 || Map.null utxo = pure []
         | otherwise = do
             inp <- elements (Map.toList utxo)
             rest <- loop (Map.delete (fst inp) utxo) (n - 1)
             pure (inp : rest)
-
-selectSomeInputs :: Hash h Addr => BlockGen h (NonEmpty (Input h Addr, Output Addr))
-selectSomeInputs = do
-    utxoMap <- use nonAvvmUtxo
-    upperLimit <- use inputPartiesUpperLimit
-    liftGen $ selectSomeInputs' upperLimit utxoMap
-
-selectDestinations :: Hash h Addr => Set (Input h Addr) -> BlockGen h (NonEmpty Addr)
-selectDestinations notThese =
-    liftGen . selectDestinations' notThese =<< use currentUtxo
-
--- | FIXME: This returns just one 'Addr' wrapped in a 'NonEmpty', drop the thing
--- and use 'selectDestination' instead.
-selectDestinations'
-    :: Hash h Addr
-    => Set (Input h Addr)
-    -> Utxo h Addr
-    -> Gen (NonEmpty Addr)
-selectDestinations' notThese u0 =
-  pure <$> selectDestination (utxoRemoveInputs notThese u0)
-
-selectDestination :: Hash h Addr => Utxo h Addr -> Gen Addr
-selectDestination u0 = do
-  -- AVVM addresses can't ever receive deposits, so we exclude them.
-  let u1 = utxoRestrictToAddr (not . isAvvmAddr) u0
-  elements (map (outAddr . snd) (utxoToList u1))
-
-
--- | Create a fresh transaction that depends on the fee provided to it.
-newTransaction :: (HasCallStack, Hash h Addr)
-               => BlockGen h (Value -> Transaction h Addr)
-newTransaction = do
-    inputs'outputs <- selectSomeInputs
-    destinations <- selectDestinations (foldMap Set.singleton (map fst inputs'outputs))
-    hash' <- freshHash
-
-    let txn = divvyUp hash' inputs'outputs destinations
-
-    -- We don't know the fee yet, but /do/ need to make it possible to
-    -- generate different kinds of transactions (i.e., different kinds of
-    -- monadic effects) depending on the UTxO. This means that we must be
-    -- conversative here.
-    currentUtxo %= utxoApply (withEstimatedFee txn)
-    pure txn
 
 -- | Given a set of inputs, tagged with their output values, and a set of output
 -- addresses, construct a transaction by dividing the sum total of the inputs
@@ -225,25 +132,10 @@ safeSubtract x y
 estimateFee :: Transaction h a -> Value
 estimateFee _ = maxFee
   where
-    maxFee = 180000
+    maxFee = 280000
 
 withEstimatedFee :: (Value -> Transaction h a) -> Transaction h a
 withEstimatedFee tx = let tx0 = tx 0 in tx0 { trFee = estimateFee tx0 }
-
-newBlock :: Hash h Addr => BlockGen h [Value -> Transaction h Addr]
-newBlock = do
-    txnCount <- liftGen $ choose (1, 10)
-    replicateM txnCount newTransaction
-
-newChain :: Hash h Addr => BlockGen h [[Value -> Transaction h Addr]]
-newChain = do
-    blockCount <- liftGen $ choose (10, 50)
-    replicateM blockCount newBlock
-
-zipFees
-    :: [[Value -> Transaction h Addr]]
-    -> ([[Value]] -> [[Transaction h Addr]])
-zipFees = zipWith (zipWith ($))
 
 {-------------------------------------------------------------------------------
   Forkable blockchains
@@ -260,9 +152,14 @@ data TreeGenGlobalCtx h = TreeGenGlobalCtx
     {- The below values form part of configuration, and are unlikely to be
        updated during tree building.
     -}
+    , _treeGenGlobalCtxAddresses                   :: ![Addr]
+      -- ^ The addresses we can choose from when generating transaction outputs
     , _treeGenGlobalCtxInputPartiesUpperLimit      :: !Int
       -- ^ The upper limit on the number of parties that may be selected as
       -- inputs to a transaction.
+    , _treeGenGlobalCtxOutputPartiesUpperLimit     :: !Int
+      -- ^ The upper limit on the number of parties that may be selected as
+      -- outputs to a transaction.
     , _treeGenGlobalCtxForkLikelihood              :: !Double
       -- ^ Likelihood of generating a forked block at any point in the tree.
       --   Only the non-integer part of this value is considered.
@@ -281,19 +178,6 @@ data TreeGenGlobalCtx h = TreeGenGlobalCtx
       -- ^ Boot transaction
     }
 
-makeFields ''TreeGenGlobalCtx
-
-initTreeGenGlobalCtx :: Transaction h Addr -> TreeGenGlobalCtx h
-initTreeGenGlobalCtx boot = TreeGenGlobalCtx
-  { _treeGenGlobalCtxFreshHashSrc = 1
-  , _treeGenGlobalCtxInputPartiesUpperLimit = 1
-  , _treeGenGlobalCtxForkLikelihood = 0.1
-  , _treeGenGlobalCtxPruneLikelihood = 0.3
-  , _treeGenGlobalCtxMaxHeight = 50
-  , _treeGenGlobalCtxSharedTransactionLikelihood = 0.5
-  , _treeGenGlobalCtxBootTransaction = boot
-  }
-
 data TreeGenBranchCtx h = TreeGenBranchCtx
     { _treeGenBranchCtxPrincipalBranch :: !Bool
       -- ^ Is this the principal branch? The principal branch will never
@@ -308,7 +192,43 @@ data TreeGenBranchCtx h = TreeGenBranchCtx
       --   in order to facilitate sharing.
     }
 
+makeFields ''TreeGenGlobalCtx
 makeFields ''TreeGenBranchCtx
+
+-- | Provide a fresh hash value for a transaction.
+freshHash :: ( HasFreshHashSrc src Int
+             , MonadState src m
+             )
+          => m Int
+freshHash = do
+    i <- use freshHashSrc
+    freshHashSrc += 1
+    pure i
+
+nonAvvmUtxo :: HasCurrentUtxo src (Utxo h Addr)
+            => Getter src (Utxo h Addr)
+nonAvvmUtxo =
+    currentUtxo . to (utxoRestrictToAddr (not . isAvvmAddr))
+
+
+initTreeGenGlobalCtx :: Transaction h Addr -> TreeGenGlobalCtx h
+initTreeGenGlobalCtx boot = TreeGenGlobalCtx
+    { _treeGenGlobalCtxFreshHashSrc                = 1
+    , _treeGenGlobalCtxAddresses                   = addrs
+    , _treeGenGlobalCtxInputPartiesUpperLimit      = 2
+    , _treeGenGlobalCtxOutputPartiesUpperLimit     = 3
+    , _treeGenGlobalCtxForkLikelihood              = 0.1
+    , _treeGenGlobalCtxPruneLikelihood             = 0.3
+    , _treeGenGlobalCtxMaxHeight                   = 50
+    , _treeGenGlobalCtxSharedTransactionLikelihood = 0.5
+    , _treeGenGlobalCtxBootTransaction             = boot
+    }
+  where
+    -- Output addresses
+    --
+    -- TODO: we may want to make this set larger
+    -- (i.e. generate additional addresses for the poor actors)
+    addrs = filter (not . isAvvmAddr) . map outAddr $ trOuts boot
 
 -- | Tree generation monad.
 newtype TreeGen h a = TreeGen
@@ -322,6 +242,9 @@ liftGenTree = TreeGen . lift
 genValidBlocktree :: Hash h Addr => PreTree h Gen ()
 genValidBlocktree = toPreTreeWith identity newTree
 
+selectDestination :: TreeGen h Addr
+selectDestination = (liftGenTree . elements) =<< use addresses
+
 toPreTreeWith
     :: Hash h Addr
     => (TreeGenGlobalCtx h -> TreeGenGlobalCtx h) -- ^ Modify the global settings
@@ -329,9 +252,10 @@ toPreTreeWith
     -> PreTree h Gen ()
 toPreTreeWith settings bg = DepIndep $ \(boot :: Transaction h Addr)-> do
     ks <- evalStateT (unTreeGen bg) (settings (initTreeGenGlobalCtx boot))
-    return $ \fees ->
-      (OldestFirst (fmap (OldestFirst . dropWhile (== boot))
-                         (zipTreeFees ks fees)), ())
+    return $ \fees -> (markOldestFirst (zipTreeFees ks fees), ())
+  where
+    markOldestFirst = OldestFirst . fmap OldestFirst
+
 
 newTree :: forall h. Hash h Addr
         => TreeGen h (NoFeeBlockTree h)
@@ -342,7 +266,7 @@ newTree = do
     maxHeight .= height
     Tree.unfoldTreeM buildTree $ initBranchCtx boot
   where
-    initBranchCtx boot = TreeGenBranchCtx True 0 (trUtxo boot) [const boot]
+    initBranchCtx boot = TreeGenBranchCtx True 0 (trUtxo boot) []
     buildTree :: TreeGenBranchCtx h
               -> TreeGen h ([Value -> Transaction h Addr], [TreeGenBranchCtx h])
     buildTree branchCtx = do
@@ -374,24 +298,25 @@ newTree = do
           _ -> liftGenTree . branchCount =<< use forkLikelihood
         branchSizes <- liftGenTree $ vectorOf numBranches $ choose (1, 10)
         stl <- use sharedTransactionLikelihood
-        txs <- replicateM
+        (txs, _) <- replicateSt
           (ceiling $ fromIntegral (maximum branchSizes) / stl)
-          (generateTransaction branchCtx)
+          generateTransaction
+          (branchCtx ^. nonAvvmUtxo)
 
         -- One may ask why we set the 'last' branch as principal. This is to
         -- reduce the amount of state being carried during constructing. The
         -- principal branch is expected to be the longest, so we would like to
         -- finish constructing short forks early.
         branches <- forM (zip [0..] branchSizes) $ \(idx, bs) -> do
-          mytxs <- liftGenTree $ replicateM bs $ elements txs
+          mytxs <- liftGenTree $ distinct bs txs
           return $ branchCtx
-            & (branchHeight +~ 1)
+            & (branchHeight    +~ 1)
             . (principalBranch .~ (idx == numBranches -1))
-            . (transactions .~ txs)
-            . (currentUtxo %~ (foldr (.) id $ utxoApply . withEstimatedFee <$> mytxs))
-
+            . (transactions    .~ mytxs)
+            . (currentUtxo      %~ (foldr (.) id $ utxoApply . withEstimatedFee <$> mytxs))
 
         return (branchCtx ^. transactions, branches)
+
     -- Calculate the number of branches to generate. We keep tossing a
     -- 'p'-weighted coin until we get a tails.
     branchCount :: Double -> Gen Int
@@ -399,15 +324,26 @@ newTree = do
       go count = do
         toss <- choose (0,1)
         if toss > p then return count else go $ count + 1
-    generateTransaction branchCtx = do
-      hash' <- freshHash
-      limit <- use inputPartiesUpperLimit
-      inputs'outputs <- liftGenTree
-        $ selectSomeInputs' limit (branchCtx ^. currentUtxo)
-      destinations <- liftGenTree
-        $ selectDestinations' (foldMap Set.singleton (map fst inputs'outputs))
-                              (branchCtx ^. currentUtxo)
-      return $ divvyUp hash' inputs'outputs destinations
+
+    generateTransaction :: Utxo h Addr
+                        -> TreeGen h (Maybe (Value -> Transaction h Addr, Utxo h Addr))
+    generateTransaction utxo = do
+      if utxoNull utxo then
+        return Nothing
+      else do
+        hash'          <- freshHash
+        maxNumInputs   <- use inputPartiesUpperLimit
+        maxNumOutputs  <- use outputPartiesUpperLimit
+        inputs'outputs <- liftGenTree $ selectSomeInputs' maxNumInputs utxo
+        numOutputs     <- liftGenTree $ choose (1, maxNumOutputs)
+        destinations   <- NE.fromList <$> replicateM numOutputs selectDestination
+        -- TODO: Right now this generates blocks with no dependent transactions
+        -- in them. We could relax that restriction, but if we do then the code
+        -- above needs to be modified also: we can no longer pick a random subset
+        -- of these transactions and assume that they are valid together.
+        let inputs = Set.fromList $ toList (fmap fst inputs'outputs)
+            utxo'  = utxoRemoveInputs inputs utxo
+        return $ Just (divvyUp hash' inputs'outputs destinations, utxo')
 
 zipTreeFees
     :: Tree [Value -> Transaction h Addr]
