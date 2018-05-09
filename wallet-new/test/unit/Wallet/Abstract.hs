@@ -16,13 +16,15 @@ module Wallet.Abstract (
   , walletBoot
   , applyBlocks
     -- * Inductive wallet definition
+  , WalletEvent(..)
   , Inductive(..)
   , uptoFirstRollback
-  , interpret
     -- ** Validation
   , ValidatedInductive(..)
   , InductiveValidationError(..)
   , inductiveIsValid
+    -- ** Interpretation
+  , interpret
     -- ** Invariants
   , Invariant
   , invariant
@@ -31,10 +33,9 @@ module Wallet.Abstract (
   , walletEquivalent
     -- ** Generation
     -- $generation
-  , InductiveWithOurs(..)
-  , genFromBlocktree
-  , genFromBlocktreeWithOurs
-  , genFromBlocktreePickingAccounts
+--  , genFromBlocktree
+--  , genFromBlocktreeWithOurs
+--  , genFromBlocktreePickingAccounts
     -- * Auxiliary operations
   , balance
   , txIns
@@ -55,8 +56,6 @@ import qualified Data.List as List
 import qualified Data.Text.Buildable
 import           Formatting (bprint, build, sformat, (%))
 import           Pos.Util.Chrono
-                   (NewestFirst(NewestFirst), toNewestFirst,
-                    OldestFirst(OldestFirst), getOldestFirst, getNewestFirst)
 import           Pos.Util.QuickCheck.Arbitrary (sublistN)
 import           Serokell.Util (listJson)
 import           Test.QuickCheck
@@ -182,91 +181,45 @@ walletBoot mkWallet p boot = applyBlock (mkWallet p) (OldestFirst [boot])
   Inductive wallet definition
 -------------------------------------------------------------------------------}
 
--- | Inductive definition of a wallet
-data Inductive h a =
-    -- | Start the wallet, given the bootstrap transaction
-    WalletBoot (Transaction h a)
-
+-- | Wallet event
+data WalletEvent h a =
     -- | Inform the wallet of a new block added to the blockchain
-  | ApplyBlock (Inductive h a) (Block h a)
+    ApplyBlock (Block h a)
 
     -- | Submit a new transaction to the wallet to be included in the blockchain
-  | NewPending (Inductive h a) (Transaction h a)
+  | NewPending (Transaction h a)
 
     -- | Roll back the last block added to the blockchain
-  | Rollback (Inductive h a)
+  | Rollback
   deriving Eq
+
+walletEventIsRollback :: WalletEvent h a -> Bool
+walletEventIsRollback Rollback = True
+walletEventIsRollback _        = False
+
+-- | Inductive definition of a wallet
+data Inductive h a = Inductive {
+      -- | Bootstrap transaction
+      inductiveBoot :: Transaction h a
+
+      -- | Addresses that belong to the wallet
+    , inductiveOurs :: Set a
+
+      -- | Wallet events
+    , inductiveEvents :: OldestFirst [] (WalletEvent h a)
+    }
 
 -- | The prefix of the 'Inductive' that doesn't include any rollbacks
 uptoFirstRollback :: Inductive h a -> Inductive h a
-uptoFirstRollback = go identity
+uptoFirstRollback i@Inductive{..} = i {
+      inductiveEvents = liftOldestFirst (takeWhile notRollback) inductiveEvents
+    }
   where
-    go :: (Inductive h a -> Inductive h a) -> Inductive h a -> Inductive h a
-    go  acc (WalletBoot t)   = acc (WalletBoot t)
-    go  acc (ApplyBlock i b) = go (acc . (`ApplyBlock` b)) i
-    go  acc (NewPending i t) = go (acc . (`NewPending` t)) i
-    go _acc (Rollback i)     = go identity                 i
-
--- | Interpreter for 'Inductive'
---
--- Given (one or more) wallet constructors, evaluate an 'Inductive' wallet,
--- checking the given property at each step.
---
--- Note: we expect the 'Inductive' to be valid (valid blockchain, valid
--- calls to 'newPending', etc.). This is meant to check properties of the
--- /wallet/, not the wallet input.
-interpret :: forall h a err.
-             (Inductive h a -> InvalidInput h a -> err)
-          -- ^ Inject invalid input err. We provide the value of the
-          -- 'Inductive' at the point of the error.
-          -> (Transaction h a -> [Wallet h a])
-          -- ^ Wallet constructors
-          -> (Inductive h a -> [Wallet h a] -> Validated err ())
-          -- ^ Predicate to check. The predicate is passed the 'Inductive'
-          -- at the point of the error, for better error messages.
-          -> Inductive h a
-          -- ^ 'Inductive' value to interpret
-          -> Validated err [Wallet h a]
-interpret invalidInput mkWallets p = fmap snd . go
-  where
-    go :: Inductive h a -> Validated err (Ledger h a, [Wallet h a])
-    go ind@(WalletBoot t) = do
-      ws <- verify ind (mkWallets t)
-      return (ledgerSingleton t, ws)
-    go ind@(ApplyBlock w b) = do
-      (l, ws) <- go w
-      ws' <- verify ind $ map (`applyBlock` b) ws
-      return (ledgerAdds (toNewestFirst b) l, ws')
-    go ind@(NewPending w t) = do
-      (l, ws) <- go w
-      ws' <- verify ind =<< mapM (verifyNew ind l t) ws
-      return (l, ws')
-    go (Rollback w) = go w
-
-    verify :: Inductive h a -> [Wallet h a] -> Validated err [Wallet h a]
-    verify ind ws = p ind ws >> return ws
-
-    -- Verify the input
-    -- If this fails, we provide the /entire/ 'Inductive' value so that it's
-    -- easier to track down what happened.
-    verifyNew :: Inductive h a -- ^ Inductive value at this point
-              -> Ledger h a    -- ^ Ledger so far (for error messages)
-              -> Transaction h a -> Wallet h a -> Validated err (Wallet h a)
-    verifyNew ind l tx w =
-        case newPending w tx of
-          Just w' -> return w'
-          Nothing -> throwError . invalidInput ind
-                   $ InvalidPending tx (utxo w) (pending w) l
+    notRollback = not . walletEventIsRollback
 
 {-------------------------------------------------------------------------------
   Validation
 -------------------------------------------------------------------------------}
-
--- | Pair an 'Inductive' wallet definition with the set of addresses owned
-data InductiveWithOurs h a = InductiveWithOurs {
-      inductiveWalletOurs :: Set a
-    , inductiveWalletDef  :: Inductive h a
-    }
 
 -- | Result of validating an inductive wallet
 data ValidatedInductive h a = ValidatedInductive {
@@ -276,10 +229,13 @@ data ValidatedInductive h a = ValidatedInductive {
       -- | Final ledger (including bootstrap)
     , viLedger :: Ledger h a
 
-      -- | Final chain (split into blocks, not including bootstrap)
-    , viChain :: Chain h a
+      -- | Validated events
+    , viEvents :: NewestFirst [] (WalletEvent h a)
 
-      -- | UTxO after each block, in
+      -- | Final chain (split into blocks, not including bootstrap)
+    , viChain :: NewestFirst [] (Block h a)
+
+      -- | UTxO after each block
     , viUtxos :: NewestFirst NonEmpty (Utxo h a)
     }
 
@@ -295,8 +251,8 @@ data InductiveValidationError h a =
 
     -- | Invalid transaction in the given block
   | InductiveInvalidApplyBlock {
-        -- | The 'Inductive' leading up to the error
-        inductiveInvalidInductive :: Inductive h a
+        -- | The events leading up to the error
+        inductiveInvalidEvents :: OldestFirst [] (WalletEvent h a)
 
         -- | The transactions in the block we successfully validated
       , inductiveInvalidBlockPrefix :: OldestFirst [] (Transaction h a)
@@ -310,8 +266,8 @@ data InductiveValidationError h a =
 
     -- | A 'NewPending' call was invalid because the input was already spent
   | InductiveInvalidNewPendingAlreadySpent {
-        -- | The 'Inductive' leading up to the error
-        inductiveInvalidInductive :: Inductive h a
+        -- | The events leading up to the error
+        inductiveInvalidEvents :: OldestFirst [] (WalletEvent h a)
 
         -- | The transaction that was invalid
       , inductiveInvalidTransaction :: Transaction h a
@@ -322,8 +278,8 @@ data InductiveValidationError h a =
 
     -- | A 'NewPending' call was invalid because the input was not @ours@
   | InductiveInvalidNewPendingNotOurs {
-        -- | The 'Inductive' leading up to the error
-        inductiveInvalidInductive :: Inductive h a
+        -- | The events leading up to the error
+        inductiveInvalidEvents :: OldestFirst [] (WalletEvent h a)
 
         -- | The transaction that was invalid
       , inductiveInvalidTransaction :: Transaction h a
@@ -337,86 +293,181 @@ data InductiveValidationError h a =
 
 -- | Lift ledger validity to 'Inductive'
 inductiveIsValid :: forall h a. (Hash h a, Buildable a, Ord a)
-                 => InductiveWithOurs h a
+                 => Inductive h a
                  -> Validated (InductiveValidationError h a) (ValidatedInductive h a)
-inductiveIsValid InductiveWithOurs{..} = goInd inductiveWalletDef
+inductiveIsValid Inductive{..} = do
+    goBoot inductiveBoot
   where
-    goInd :: Inductive h a
-          -> Validated (InductiveValidationError h a) (ValidatedInductive h a)
-    goInd (WalletBoot boot) = do
-      let ledger = ledgerEmpty
-      validatedMapErrors (InductiveInvalidBoot boot) $
-        trIsAcceptable boot ledger
-      return ValidatedInductive {
-          viBoot   = boot
-        , viLedger = ledgerAdd boot ledger
-        , viChain  = OldestFirst []
-        , viUtxos  = NewestFirst (trUtxo boot :| [])
-        }
-    goInd (ApplyBlock i b) = do
-      ValidatedInductive{..} <- goInd i
-      ledger' <- goBlock i (OldestFirst []) viLedger b
-      let chain' = OldestFirst . (++ [b]) . getOldestFirst $ viChain
-          utxos' = NewestFirst
-                 . (\(u :| us) -> utxoApplyBlock b u :| (u:us))
-                 . getNewestFirst
-                 $ viUtxos
+    goBoot :: Transaction h a
+           -> Validated (InductiveValidationError h a) (ValidatedInductive h a)
+    goBoot boot = do
+        let ledger = ledgerEmpty
+        validatedMapErrors (InductiveInvalidBoot boot) $
+          trIsAcceptable boot ledger
+        goEvents (getOldestFirst inductiveEvents) ValidatedInductive {
+            viBoot   = boot
+          , viLedger = ledgerAdd boot ledger
+          , viEvents = NewestFirst []
+          , viChain  = NewestFirst []
+          , viUtxos  = NewestFirst (trUtxo boot :| [])
+          }
+
+    goEvents :: [WalletEvent h a]
+             -> ValidatedInductive h a -- accumulator
+             -> Validated (InductiveValidationError h a) (ValidatedInductive h a)
+    goEvents [] acc =
+        return acc
+    goEvents (ApplyBlock b:es) ValidatedInductive{..} = do
+        ledger' <- goBlock (toOldestFirst viEvents) (OldestFirst []) viLedger b
+        goEvents es ValidatedInductive {
+            viBoot   = viBoot
+          , viLedger = ledger'
+          , viEvents = liftNewestFirst (ApplyBlock b :) viEvents
+          , viChain  = liftNewestFirst (           b :) viChain
+          , viUtxos  = newCheckpoint               b    viUtxos
+          }
+    goEvents (Rollback:es) ValidatedInductive{..} = do
+      let chain' = liftNewestFirst List.tail viChain
       return ValidatedInductive {
           viBoot   = viBoot
-        , viLedger = ledger'
+        , viLedger = revChainToLedger chain'
+        , viEvents = liftNewestFirst (Rollback :) viEvents
         , viChain  = chain'
-        , viUtxos  = utxos'
+        , viUtxos  = prevCheckpoint viUtxos
         }
-    goInd (NewPending i t) = do
-      vi@ValidatedInductive{..} <- goInd i
-      let utxo     = let NewestFirst (u :| _) = viUtxos in u
-          inputs   = Set.toList (trIns t)
-          resolved = map (`utxoAddressForInput` utxo) inputs
-      forM_ (zip inputs resolved) $ \(input, mAddr) ->
-        case mAddr of
-          Nothing ->
-            throwError InductiveInvalidNewPendingAlreadySpent {
-                inductiveInvalidInductive   = i
-              , inductiveInvalidTransaction = t
-              , inductiveInvalidInput       = input
-              }
-          Just addr ->
-            unless (addr `Set.member` inductiveWalletOurs) $
-              throwError InductiveInvalidNewPendingNotOurs {
-                  inductiveInvalidInductive   = i
+    goEvents (NewPending t:es) vi@ValidatedInductive{..} = do
+        let utxo     = let NewestFirst (u :| _) = viUtxos in u
+            inputs   = Set.toList (trIns t)
+            resolved = map (`utxoAddressForInput` utxo) inputs
+        forM_ (zip inputs resolved) $ \(input, mAddr) ->
+          case mAddr of
+            Nothing ->
+              throwError InductiveInvalidNewPendingAlreadySpent {
+                  inductiveInvalidEvents      = toOldestFirst viEvents
                 , inductiveInvalidTransaction = t
                 , inductiveInvalidInput       = input
-                , inductiveInvalidAddress     = addr
                 }
-      return vi
-    goInd (Rollback i) = do
-      ValidatedInductive{..} <- goInd i
-      -- strip latest block
-      let chain' = OldestFirst . List.init . getOldestFirst $ viChain
-          utxos' = NewestFirst
-                 . (\(_u :| (u':us)) -> u' :| us)
-                 . getNewestFirst
-                 $ viUtxos
-      return ValidatedInductive {
-          viBoot   = viBoot
-        , viLedger = chainToLedger viBoot chain'
-        , viChain  = chain'
-        , viUtxos  = utxos'
-        }
+            Just addr ->
+              unless (addr `Set.member` inductiveOurs) $
+                throwError InductiveInvalidNewPendingNotOurs {
+                    inductiveInvalidEvents      = toOldestFirst viEvents
+                  , inductiveInvalidTransaction = t
+                  , inductiveInvalidInput       = input
+                  , inductiveInvalidAddress     = addr
+                  }
+        goEvents es vi
 
-    goBlock :: Inductive h a -- Inductive leading to this point (for err msgs)
-            -> Block h a     -- Prefix of the block already validated (for err msgs)
-            -> Ledger h a    -- Ledger so far
-            -> Block h a     -- Suffix of the block yet to validate
+    goBlock :: OldestFirst [] (WalletEvent h a) -- Events leading to this point (for err msgs)
+            -> Block h a  -- Prefix of the block already validated (for err msgs)
+            -> Ledger h a -- Ledger so far
+            -> Block h a  -- Suffix of the block yet to validate
             -> Validated (InductiveValidationError h a) (Ledger h a)
-    goBlock i = go
+    goBlock events = go
       where
         go _ ledger (OldestFirst []) =
           return ledger
         go (OldestFirst done) ledger (OldestFirst (t:todo)) = do
-          validatedMapErrors (InductiveInvalidApplyBlock i (OldestFirst done) t) $
+          validatedMapErrors (InductiveInvalidApplyBlock events (OldestFirst done) t) $
             trIsAcceptable t ledger
           go (OldestFirst (done ++ [t])) (ledgerAdd t ledger) (OldestFirst todo)
+
+    revChainToLedger :: NewestFirst [] (Block h a) -> Ledger h a
+    revChainToLedger = Ledger
+                     . NewestFirst
+                     . (inductiveBoot :)
+                     . concatMap toList . toList
+
+    newCheckpoint :: Block h a
+                  -> NewestFirst NonEmpty (Utxo h a)
+                  -> NewestFirst NonEmpty (Utxo h a)
+    newCheckpoint b = liftNewestFirst $ \(u :| us) ->
+        utxoApplyBlock b u :| (u:us)
+
+    prevCheckpoint :: NewestFirst NonEmpty (Utxo h a)
+                   -> NewestFirst NonEmpty (Utxo h a)
+    prevCheckpoint = liftNewestFirst $ \(_u :| (u':us))
+        -> u' :| us
+
+{-------------------------------------------------------------------------------
+  Interpreter
+-------------------------------------------------------------------------------}
+
+-- | Interpreter for 'Inductive'
+--
+-- Given (one or more) wallet constructors, evaluate an 'Inductive' wallet,
+-- checking the given property at each step.
+--
+-- Note: we expect the 'Inductive' to be valid (valid blockchain, valid
+-- calls to 'newPending', etc.). This is meant to check properties of the
+-- /wallet/, not the wallet input. See 'isInductiveValid'.
+interpret :: forall h a err.
+             (OldestFirst [] (WalletEvent h a) -> InvalidInput h a -> err)
+          -- ^ Inject invalid input err.
+          -- We provide the events that lead to the error.
+          -> (Transaction h a -> [Wallet h a])
+          -- ^ Wallet constructors
+          -> (OldestFirst [] (WalletEvent h a) -> [Wallet h a] -> Validated err ())
+          -- ^ Predicate to check. The predicate is passed the events leading
+          -- to this point, for better error messages.
+          -> Inductive h a
+          -- ^ 'Inductive' value to interpret
+          -> Validated err [Wallet h a]
+interpret invalidInput mkWallets p Inductive{..} =
+    goBoot inductiveBoot
+  where
+    goBoot :: Transaction h a -> Validated err [Wallet h a]
+    goBoot boot = do
+        let history = []
+        ws <- verify history (mkWallets boot)
+        goEvents history ws (getOldestFirst inductiveEvents)
+
+    goEvents :: [WalletEvent h a]  -- history
+             -> [Wallet h a]       -- accumulator
+             -> [WalletEvent h a]  -- events to process
+             -> Validated err [Wallet h a]
+    goEvents _ acc [] =
+        return acc
+    goEvents history acc (ApplyBlock b:es) = do
+        let history' = ApplyBlock b : history
+        acc' <- verify history' $ map (`applyBlock` b) acc
+        goEvents history' acc' es
+    goEvents history acc (NewPending t:es) = do
+        let history' = NewPending t : history
+        acc' <- verify history' =<< mapM (newPending' history t) acc
+        goEvents history' acc' es
+    goEvents history acc (Rollback:es) = do
+        let history' = Rollback : history
+        acc' <- verify history' $ map rollback acc
+        goEvents history' acc' es
+
+    verify :: [WalletEvent h a]
+           -> [Wallet h a] -> Validated err [Wallet h a]
+    verify history ws = p (OldestFirst (reverse history)) ws >> return ws
+
+    newPending' :: [WalletEvent h a]
+                -> Transaction h a
+                -> Wallet h a -> Validated err (Wallet h a)
+    newPending' history tx w =
+        case newPending w tx of
+          Just w' -> return w'
+          Nothing -> throwError . invalidInput (OldestFirst (reverse history))
+                   $ InvalidPending tx (utxo w) (pending w)
+
+-- | We were unable to check the invariant because the input was invalid
+--
+-- This indicates a bug in the generator (or in the hand-written 'Inductive'),
+-- so we try to provide sufficient information to track that down.
+data InvalidInput h a =
+    InvalidPending {
+        -- | The submitted transaction that was invalid
+        invalidPendingTransaction :: Transaction h a
+
+        -- | The UTxO of the wallet at the time of submission
+      , invalidPendingWalletUtxo :: Utxo h a
+
+        -- | The pending set of the wallet at time of submission
+      , invalidPendingWalletPending :: Pending h a
+      }
 
 {-------------------------------------------------------------------------------
   Invariants
@@ -440,30 +491,30 @@ invariant :: forall h a.
           -> Invariant h a
 invariant name e p = void . interpret notChecked ((:[]) . e) p'
   where
-    notChecked :: Inductive h a
+    notChecked :: OldestFirst [] (WalletEvent h a)
                -> InvalidInput h a
                -> InvariantViolation h a
-    notChecked ind reason = InvariantNotChecked {
-          invariantNotCheckedName      = name
-        , invariantNotCheckedReason    = reason
-        , invariantNotCheckedInductive = ind
+    notChecked history reason = InvariantNotChecked {
+          invariantNotCheckedName   = name
+        , invariantNotCheckedReason = reason
+        , invariantNotCheckedEvents = history
         }
 
-    violation :: Inductive h a
+    violation :: OldestFirst [] (WalletEvent h a)
               -> InvariantViolationEvidence
               -> InvariantViolation h a
-    violation ind ev = InvariantViolation {
-          invariantViolationName      = name
-        , invariantViolationEvidence  = ev
-        , invariantViolationInductive = ind
+    violation history ev = InvariantViolation {
+          invariantViolationName     = name
+        , invariantViolationEvidence = ev
+        , invariantViolationEvents   = history
         }
 
-    p' :: Inductive h a
+    p' :: OldestFirst [] (WalletEvent h a)
        -> [Wallet h a]
        -> Validated (InvariantViolation h a) ()
-    p' ind [w] = case p w of
-                   Nothing -> return ()
-                   Just ev -> throwError (violation ind ev)
+    p' history [w] = case p w of
+                       Nothing -> return ()
+                       Just ev -> throwError (violation history ev)
     p' _ _ = error "impossible"
 
 -- | Invariant violation
@@ -476,8 +527,8 @@ data InvariantViolation h a =
         -- | Evidence that the invariant was violated
       , invariantViolationEvidence :: InvariantViolationEvidence
 
-        -- | The 'Inductive' value at the point of the error
-      , invariantViolationInductive :: Inductive h a
+        -- | The evens that led to the error
+      , invariantViolationEvents :: OldestFirst [] (WalletEvent h a)
       }
 
     -- | The invariant was not checked because the input was invalid
@@ -488,27 +539,8 @@ data InvariantViolation h a =
         -- | Why did we not check the invariant
       , invariantNotCheckedReason :: InvalidInput h a
 
-        -- | The 'Inductive' value at the point of the error
-      , invariantNotCheckedInductive :: Inductive h a
-      }
-
--- | We were unable to check the invariant because the input was invalid
---
--- This indicates a bug in the generator (or in the hand-written 'Inductive'),
--- so we try to provide sufficient information to track that down.
-data InvalidInput h a =
-    InvalidPending {
-        -- | The submitted transaction that was invalid
-        invalidPendingTransaction :: Transaction h a
-
-        -- | The UTxO of the wallet at the time of submission
-      , invalidPendingWalletUtxo :: Utxo h a
-
-        -- | The pending set of the wallet at time of submission
-      , invalidPendingWalletPending :: Pending h a
-
-        -- | The ledger seen so far at the time of submission
-      , invalidPendingLedger :: Ledger h a
+        -- | The evens that led to the error
+      , invariantNotCheckedEvents :: OldestFirst [] (WalletEvent h a)
       }
 
 {-------------------------------------------------------------------------------
@@ -630,28 +662,28 @@ walletEquivalent :: forall h a. (Hash h a, Eq a, Buildable a)
 walletEquivalent lbl e e' = void .
     interpret notChecked (\boot -> [e boot, e' boot]) p
   where
-    notChecked :: Inductive h a
+    notChecked :: OldestFirst [] (WalletEvent h a)
                -> InvalidInput h a
                -> InvariantViolation h a
-    notChecked ind reason = InvariantNotChecked {
-          invariantNotCheckedName      = lbl
-        , invariantNotCheckedReason    = reason
-        , invariantNotCheckedInductive = ind
+    notChecked history reason = InvariantNotChecked {
+          invariantNotCheckedName   = lbl
+        , invariantNotCheckedReason = reason
+        , invariantNotCheckedEvents = history
         }
 
-    violation :: Inductive h a
+    violation :: OldestFirst [] (WalletEvent h a)
               -> InvariantViolationEvidence
               -> InvariantViolation h a
-    violation ind ev = InvariantViolation {
-          invariantViolationName      = lbl
-        , invariantViolationEvidence  = ev
-        , invariantViolationInductive = ind
+    violation history ev = InvariantViolation {
+          invariantViolationName     = lbl
+        , invariantViolationEvidence = ev
+        , invariantViolationEvents   = history
         }
 
-    p :: Inductive h a
+    p :: OldestFirst [] (WalletEvent h a)
       -> [Wallet h a]
       -> Validated (InvariantViolation h a) ()
-    p ind [w, w'] = sequence_ [
+    p history [w, w'] = sequence_ [
           cmp "pending"          pending
         , cmp "utxo"             utxo
         , cmp "availableBalance" availableBalance
@@ -668,7 +700,7 @@ walletEquivalent lbl e e' = void .
         cmp fld f =
           case checkEqual (fld <> " w", f w) (fld <> " w'", f w') of
             Nothing -> return ()
-            Just ev -> throwError $ violation ind ev
+            Just ev -> throwError $ violation history ev
     p _ _ = error "impossible"
 
 {-------------------------------------------------------------------------------
@@ -702,6 +734,7 @@ utxoRestrictToOurs p = utxoRestrictToAddr (isJust . p)
   Generation
 -------------------------------------------------------------------------------}
 
+{-
 -- $generation
 --
 -- The 'Inductive' data type describes a potential history of a wallet's
@@ -1143,6 +1176,7 @@ Then, when we finally go to 'conssec' the @IntMap [Action h a]@ back into a
 TODO: This means that currently we never insert pending transactions before
 the first block after boot.
 -}
+-}
 
 {-------------------------------------------------------------------------------
   Pretty-printing
@@ -1153,39 +1187,37 @@ instance (Hash h a, Buildable a) => Buildable (Pending h a) where
 
 instance (Hash h a, Buildable a) => Buildable (InvalidInput h a) where
   build InvalidPending{..} = bprint
-    ( "InvalidPending "
+    ( "InvalidPendinag "
     % "{ transaction:   " % build
     % ", walletUtxo:    " % build
     % ", walletPending: " % build
-    % ", ledger:        " % build
     % "}"
     )
     invalidPendingTransaction
     invalidPendingWalletUtxo
     invalidPendingWalletPending
-    invalidPendingLedger
 
 instance (Hash h a, Buildable a) => Buildable (InvariantViolation h a) where
   build InvariantViolation{..} = bprint
     ( "InvariantViolation "
-    % "{ name:      " % build
-    % ", evidence:  " % build
-    % ", inductive: " % build
+    % "{ name:     " % build
+    % ", evidence: " % build
+    % ", events:   " % build
     % "}"
     )
     invariantViolationName
     invariantViolationEvidence
-    invariantViolationInductive
+    invariantViolationEvents
   build (InvariantNotChecked{..}) = bprint
     ( "InvariantNotChecked "
-    % "{ name:      " % build
-    % ", reason:    " % build
-    % ", inductive: " % build
+    % "{ name:   " % build
+    % ", reason: " % build
+    % ", events: " % build
     % "}"
     )
     invariantNotCheckedName
     invariantNotCheckedReason
-    invariantNotCheckedInductive
+    invariantNotCheckedEvents
 
 instance Buildable InvariantViolationEvidence where
   build (NotEqual (labelX, x) (labelY, y)) = bprint
@@ -1238,39 +1270,25 @@ instance Buildable InvariantViolationEvidence where
     (labelXs <> " `intersection` " <> labelYs)
       (Set.toList $ xs `Set.intersection` ys)
 
--- | We output the inductive in the order that things are applied; something like
---
--- > { "boot": <boot transaction>
--- > , "block": <first block>
--- > , "new": <first transaction>
--- > , "block": <second block>
--- > ..
--- > }
+instance (Hash h a, Buildable a) => Buildable (OldestFirst [] (WalletEvent h a)) where
+  build = bprint listJson . getOldestFirst
+
+instance (Hash h a, Buildable a) => Buildable (WalletEvent h a) where
+  build (ApplyBlock b) = bprint ("ApplyBlock " % build) b
+  build (NewPending t) = bprint ("NewPending " % build) t
+  build Rollback       = bprint "Rollback"
+
 instance (Hash h a, Buildable a) => Buildable (Inductive h a) where
-  build ind = bprint (build % "}") (go ind)
-    where
-      go (WalletBoot   t) = bprint (        "{ boot:     " % build)        t
-      go (ApplyBlock n b) = bprint (build % ", block:    " % build) (go n) b
-      go (NewPending n t) = bprint (build % ", new:      " % build) (go n) t
-      go (Rollback   n  ) = bprint (build % ", rollback: "        ) (go n)
-
-instance (Hash h a, Buildable a) => Buildable (Action h a) where
-  build (ApplyBlock' b) = bprint ("ApplyBlock' " % build) b
-  build (NewPending' t) = bprint ("NewPending' " % build) t
-  build Rollback'       = bprint "Rollback'"
-
-instance (Hash h a, Buildable a) => Buildable [Action h a] where
-  build = bprint listJson
-
-instance (Hash h a, Buildable a) => Buildable (InductiveWithOurs h a) where
-  build InductiveWithOurs{..} = bprint
+  build Inductive{..} = bprint
     ( "InductiveWithOurs"
-    % "{ ours: " % listJson
-    % ", def:  " % build
+    % "{ boot: "   % build
+    % ", ours:   " % listJson
+    % ", events: " % build
     % "}"
     )
-    inductiveWalletOurs
-    inductiveWalletDef
+    inductiveBoot
+    (Set.toList inductiveOurs)
+    inductiveEvents
 
 instance (Hash h a, Buildable a) => Buildable (InductiveValidationError h a) where
   build InductiveInvalidBoot{..} = bprint
@@ -1283,34 +1301,34 @@ instance (Hash h a, Buildable a) => Buildable (InductiveValidationError h a) whe
     inductiveInvalidError
   build InductiveInvalidApplyBlock{..} = bprint
     ( "InductiveInvalidApplyBlock"
-    % "{ inductive:   " % build
+    % "{ events:      " % build
     % ", blockPrefix: " % build
     % ", transaction: " % build
     % ", error:       " % build
     % "}")
-    inductiveInvalidInductive
+    inductiveInvalidEvents
     inductiveInvalidBlockPrefix
     inductiveInvalidTransaction
     inductiveInvalidError
   build InductiveInvalidNewPendingAlreadySpent{..} = bprint
     ( "InductiveInvalidNewPendingAlreadySpent"
-    % "{ inductive:   " % build
+    % "{ events:      " % build
     % ", transaction: " % build
     % ", input:       " % build
     % "}"
     )
-    inductiveInvalidInductive
+    inductiveInvalidEvents
     inductiveInvalidTransaction
     inductiveInvalidInput
   build InductiveInvalidNewPendingNotOurs{..} = bprint
     ( "InductiveInvalidNewPendingNotOurs"
-    % "{ inductive:   " % build
+    % "{ events:      " % build
     % ", transaction: " % build
     % ", input:       " % build
     % ", address:     " % build
     % "}"
     )
-    inductiveInvalidInductive
+    inductiveInvalidEvents
     inductiveInvalidTransaction
     inductiveInvalidInput
     inductiveInvalidAddress

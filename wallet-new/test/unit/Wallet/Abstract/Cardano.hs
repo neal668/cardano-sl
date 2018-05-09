@@ -3,7 +3,7 @@
 
 module Wallet.Abstract.Cardano (
     -- * Cardano interpreter for the inductive wallet
-    InductiveT(..)
+    EventCallbacks(..)
   , interpretT
     -- * Equivalence check
   , EquivalenceViolation(..)
@@ -17,6 +17,7 @@ import           Formatting (bprint, build, (%))
 import           Pos.Txp (Utxo, formatUtxo)
 import           Pos.Core (HasConfiguration, Coin, unsafeIntegerToCoin)
 import           Pos.Crypto (EncryptedSecretKey)
+import           Pos.Util.Chrono
 import qualified Cardano.Wallet.Kernel as Kernel
 import           Cardano.Wallet.Kernel.Types
 
@@ -26,6 +27,7 @@ import           UTxO.DSL (Hash)
 import qualified UTxO.DSL as DSL
 import           UTxO.Interpreter
 import           UTxO.Translate
+import           Util
 import           Wallet.Abstract
 
 {-------------------------------------------------------------------------------
@@ -36,7 +38,7 @@ import           Wallet.Abstract
 --
 -- We do not run the callback in the 'IntT' monad so that we maintain
 -- control over the interpretation context.
-data InductiveT h m = InductiveT {
+data EventCallbacks h m = EventCallbacks {
       -- | Initialize the wallet
       --
       -- The callback is given the translated UTxO of the bootstrap
@@ -49,12 +51,19 @@ data InductiveT h m = InductiveT {
 
       -- | Insert new pending transaction
     , walletNewPendingT :: InductiveCtxt h -> Kernel.WalletId -> RawResolvedTx -> m ()
+
+      -- | Rollback
+      --
+      -- TODO: Do we want to call 'switch' here? If so, we need some of the logic
+      -- from the wallet worker thread to collapse multiple rollbacks and
+      -- apply blocks into a single call to switch
+    , walletRollbackT :: InductiveCtxt h -> Kernel.WalletId -> m ()
     }
 
--- | The context in which a function of 'InductiveT' gets called
+-- | The context in which a function of 'EventCallbacks' gets called
 data InductiveCtxt h = InductiveCtxt {
-      -- | The 'Inductive' value that led to this point
-      inductiveCtxtInd :: Inductive h Addr
+      -- | The events that led to this point
+      inductiveCtxtEvents :: OldestFirst [] (WalletEvent h Addr)
 
       -- | The 'IntCtxt' suitable for translation derived values
       -- (such as UTxOs)
@@ -67,37 +76,60 @@ data InductiveCtxt h = InductiveCtxt {
 -- | Interpreter for inductive wallets using the translated Cardano types
 interpretT :: forall h e m. (Monad m, Hash h Addr)
            => (DSL.Transaction h Addr -> Wallet h Addr)
-           -> InductiveT h (TranslateT e m)
+           -> EventCallbacks h (TranslateT e m)
            -> Inductive h Addr
            -> TranslateT (Either IntException e) m (Wallet h Addr, IntCtxt h)
-interpretT mkWallet InductiveT{..} ind'' =
-    -- This is ugly, but we only discover the bootstrap transaction once we
-    -- descend down the 'Inductive' wallet. We will 'put' the right context
-    -- before the first call to 'int'.
-    runIntT (error "interpretT: the impossible happened") (fst <$> go ind'')
+interpretT mkWallet EventCallbacks{..} Inductive{..} =
+    goBoot inductiveBoot
   where
-    go :: Inductive h Addr -> IntT h e m (Wallet h Addr, Kernel.WalletId)
-    go ind'@(WalletBoot t) = do
-        let w' = mkWallet t
-        ic <- liftTranslateInt (initIntCtxt t)
-        put ic
-        utxo' <- int (utxo w') -- translating UTxO does not change the state
-        wid <- liftTranslate $ walletBootT (InductiveCtxt ind' ic w') utxo'
-        return (w',wid)
-    go ind'@(ApplyBlock ind b) = do
-        (w,wid) <- go ind
-        let w' = applyBlock w b
-        b' <- int b
-        ic <- get
-        liftTranslate $ walletApplyBlockT (InductiveCtxt ind' ic w') wid b'
-        return (w',wid)
-    go ind'@(NewPending ind t) = do
-        (w,wid) <- go ind
-        let (Just w') = newPending w t
-        t' <- int t
-        ic <- get
-        liftTranslate $ walletNewPendingT (InductiveCtxt ind' ic w') wid t'
-        return (w',wid)
+    goBoot :: DSL.Transaction h Addr
+           -> TranslateT (Either IntException e) m (Wallet h Addr, IntCtxt h)
+    goBoot boot = do
+        let w' = mkWallet boot
+        initCtxt <- mapTranslateErrors Left $ initIntCtxt boot
+        runIntT initCtxt $ do
+          let history = NewestFirst []
+          utxo' <- int (utxo w') -- translating UTxO does not change the state
+          let ctxt = InductiveCtxt (toOldestFirst history) initCtxt w'
+          wid   <- liftTranslate $ walletBootT ctxt utxo'
+          goEvents wid history w' (getOldestFirst inductiveEvents)
+
+    goEvents :: Kernel.WalletId
+             -> NewestFirst [] (WalletEvent h Addr)
+             -> Wallet h Addr
+             -> [WalletEvent h Addr]
+             -> IntT h e m (Wallet h Addr)
+    goEvents wid = go
+      where
+        go :: NewestFirst [] (WalletEvent h Addr)
+           -> Wallet h Addr
+           -> [WalletEvent h Addr]
+           -> IntT h e m (Wallet h Addr)
+        go _ w [] =
+            return w
+        go history w (ApplyBlock b:es) = do
+            let history' = liftNewestFirst (ApplyBlock b :) history
+                w'       = applyBlock w b
+            b' <- int b
+            ic <- get
+            let ctxt = InductiveCtxt (toOldestFirst history') ic w'
+            liftTranslate $ walletApplyBlockT ctxt wid b'
+            go history' w' es
+        go history w (NewPending t:es) = do
+            let history'  = liftNewestFirst (NewPending t :) history
+                (Just w') = newPending w t
+            t' <- int t
+            ic <- get
+            let ctxt = InductiveCtxt (toOldestFirst history') ic w'
+            liftTranslate $ walletNewPendingT ctxt wid t'
+            go history' w' es
+        go history w (Rollback:es) = do
+            let history' = liftNewestFirst (Rollback :) history
+                w'       = rollback w
+            ic <- get
+            let ctxt = InductiveCtxt (toOldestFirst history') ic w'
+            liftTranslate $ walletRollbackT ctxt wid
+            go history' w' es
 
 {-------------------------------------------------------------------------------
   Equivalence check between the real implementation and (a) pure wallet
@@ -113,7 +145,7 @@ equivalentT :: forall h m. (HasConfiguration, Hash h Addr, MonadIO m)
 equivalentT activeWallet esk = \mkWallet w ->
       fmap validatedFromEither
     $ catchSomeTranslateErrors
-    $ interpretT mkWallet InductiveT{..} w
+    $ interpretT mkWallet EventCallbacks{..} w
   where
     passiveWallet = Kernel.walletPassive activeWallet
 
@@ -168,9 +200,9 @@ equivalentT activeWallet esk = \mkWallet w ->
 
           unless (translated == kernel) $
             throwError EquivalenceViolation {
-                equivalenceViolationName      = fld
-              , equivalenceViolationInductive = inductiveCtxtInd
-              , equivalenceViolationEvidence  = NotEquivalent {
+                equivalenceViolationName     = fld
+              , equivalenceViolationEvents   = inductiveCtxtEvents
+              , equivalenceViolationEvidence = NotEquivalent {
                     notEquivalentDsl        = dsl
                   , notEquivalentTranslated = translated
                   , notEquivalentKernel     = kernel
@@ -185,9 +217,9 @@ equivalentT activeWallet esk = \mkWallet w ->
         ma' <- catchTranslateErrors $ runIntT' inductiveCtxtInt $ int a
         case ma' of
           Left err -> throwError $ EquivalenceNotChecked {
-              equivalenceNotCheckedName      = fld
-            , equivalenceNotCheckedReason    = err
-            , equivalenceNotCheckedInductive = inductiveCtxtInd
+              equivalenceNotCheckedName   = fld
+            , equivalenceNotCheckedReason = err
+            , equivalenceNotCheckedEvents = inductiveCtxtEvents
             }
           Right (a', _ic') ->
             return a'
@@ -201,8 +233,8 @@ data EquivalenceViolation h =
         -- | Evidence (what was not the same?)
       , equivalenceViolationEvidence :: EquivalenceViolationEvidence
 
-        -- | The 'Inductive' value at the point of the error
-      , equivalenceViolationInductive :: Inductive h Addr
+        -- | The events that led to the error
+      , equivalenceViolationEvents :: OldestFirst [] (WalletEvent h Addr)
       }
 
     -- | We got an unexpected interpretation exception
@@ -215,8 +247,8 @@ data EquivalenceViolation h =
         -- | Why did we not check the equivalence
       , equivalenceNotCheckedReason :: IntException
 
-        -- | The 'Inductive' value at the point of the error
-      , equivalenceNotCheckedInductive :: Inductive h Addr
+        -- | The events that led to the error
+      , equivalenceNotCheckedEvents :: OldestFirst [] (WalletEvent h Addr)
       }
 
 data EquivalenceViolationEvidence =
@@ -235,22 +267,22 @@ instance Hash h Addr => Buildable (EquivalenceViolation h) where
     ( "EquivalenceViolation "
     % "{ name:      " % build
     % ", evidence:  " % build
-    % ", inductive: " % build
+    % ", events:    " % build
     % "}"
     )
     equivalenceViolationName
     equivalenceViolationEvidence
-    equivalenceViolationInductive
+    equivalenceViolationEvents
   build (EquivalenceNotChecked{..}) = bprint
     ( "EquivalenceNotChecked "
     % "{ name:      " % build
     % ", reason:    " % build
-    % ", inductive: " % build
+    % ", events:    " % build
     % "}"
     )
     equivalenceNotCheckedName
     equivalenceNotCheckedReason
-    equivalenceNotCheckedInductive
+    equivalenceNotCheckedEvents
 
 instance Buildable EquivalenceViolationEvidence where
   build NotEquivalent{..} = bprint
